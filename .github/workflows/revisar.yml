@@ -1,0 +1,46 @@
+name: Revisar mensajes nuevos
+
+# Corre en la nube de GitHub, sin depender del PC.
+# 11:30 UTC = 07:30 u 08:30 en Chile segun el horario del ano.
+# El canal de opusdei.org muestra unas dos semanas, asi que una corrida diaria
+# deja margen de sobra aunque alguna falle. Si falla, GitHub avisa por correo.
+on:
+  schedule:
+    - cron: "30 11 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: revisar
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Probar el filtro (sin red)
+        run: python revisar.py --autotest
+
+      - name: Revisar el canal y avisar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python revisar.py
+
+      # Se guarda aunque Telegram haya fallado, para no perder los nuevos.
+      - name: Guardar mensajes.json
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add mensajes.json
+          git diff --staged --quiet || git commit -m "Actualizar mensajes.json"
+          git push
