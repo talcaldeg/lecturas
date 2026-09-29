@@ -82,12 +82,13 @@ def bajar(url, intentos=4):
     raise SystemExit(f"ERROR: no se pudo leer {url}: {ultimo}")
 
 
-def avisar(m):
+def avisar(m, texto=None):
+    """Manda el aviso al grupo; cronica.py lo reutiliza con su propio texto."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat:
         raise SystemExit("ERROR: faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
-    texto = f"📜 Nuevo: {m['titulo']}\n{m['url']}\n\nPendientes y leídos: {PAGINA}"
+    texto = texto or f"📜 Nuevo: {m['titulo']}\n{m['url']}\n\nPendientes y leídos: {PAGINA}"
     datos = urllib.parse.urlencode({"chat_id": chat, "text": texto}).encode()
     for i in range(3):
         try:
