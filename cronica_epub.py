@@ -207,24 +207,41 @@ def _cuerpo(cuerpo, urls: list[str]) -> str:
     return "\n".join(p for p in partes if p)
 
 
-def leer_articulo(s: requests.Session, url: str, urls: list[str]) -> dict | None:
-    """El artículo, o None si no es de una sección elegida."""
+def pagina(s: requests.Session, url: str) -> BeautifulSoup:
     r = s.get(url, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     if soup.select_one(".um-page-loggedout"):
         sys.exit("Un artículo volvió al login: la sesión no quedó iniciada.")
-    seccion = _texto(soup.select_one(".post_custom_field.location"))
-    if not seccion.lower().startswith(SECCIONES):
-        return None
+    return soup
+
+
+def seccion_de(soup: BeautifulSoup) -> str:
+    return _texto(soup.select_one(".post_custom_field.location"))
+
+
+def es_audio(url: str) -> bool:
+    return "/audio-cronica-" in url
+
+
+def extraer(soup: BeautifulSoup, seccion: str, urls: list[str]) -> dict:
+    """Título, bajada, foto de cabecera y cuerpo. Hay dos plantillas: la habitual, con
+    .post_content, y una sin campos (texto directo en .l-section-h), que usó el editorial de junio."""
     cuerpo = soup.select_one(".post_content")
     if cuerpo is None:
-        sys.exit("Cambió la estructura del sitio: no aparece .post_content.")
-    titulo = _texto(soup.select_one(".post_title")) or seccion
+        secs = [d for d in soup.select(".l-section-h") if d.find_all("p", recursive=False)]
+        if not secs:
+            sys.exit("Cambió la estructura del sitio: no aparece el texto del artículo.")
+        cuerpo = max(secs, key=lambda d: len(d.find_all("p", recursive=False)))
+    og = (soup.find("meta", property="og:title") or {}).get("content", "")
+    titulo = _texto(soup.select_one(".post_title")) or re.sub(r"\s+[–-]\s+Crónica$", "", og) or seccion
     cabecera = None
     img = soup.select_one(".post_image img")
-    if img is not None and _src(img):
-        urls.append(_src(img))
+    src = _src(img) if img is not None else None
+    if src is None and soup.select_one(".post_content") is None:
+        src = (soup.find("meta", property="og:image") or {}).get("content")
+    if src:
+        urls.append(src)
         cabecera = len(urls) - 1
     return {
         "titulo": titulo,
@@ -233,6 +250,22 @@ def leer_articulo(s: requests.Session, url: str, urls: list[str]) -> dict | None
         "cabecera": cabecera,
         "cuerpo": _cuerpo(cuerpo, urls),
     }
+
+
+def numero(s: requests.Session, mes: int, anio: int, urls: list[str]) -> list[dict]:
+    """Los artículos de las secciones elegidas, en el orden del sumario.
+    Si el número no trae ningún "Editorial" marcado, se toma como editorial el primer
+    artículo (sin contar el audio) cuando no tiene sección: es el lugar que ocupa siempre."""
+    paginas = [(u, pagina(s, u)) for u in articulos(s, mes, anio) if not es_audio(u)]
+    secciones = [seccion_de(p) for _, p in paginas]
+    hay_editorial = any(x.lower().startswith("editorial") for x in secciones)
+    salida = []
+    for i, ((_, soup), sec) in enumerate(zip(paginas, secciones)):
+        if not sec and i == 0 and not hay_editorial:
+            sec = "Editorial"
+        if sec.lower().startswith(SECCIONES):
+            salida.append(extraer(soup, sec, urls))
+    return salida
 
 
 def bajar_imagen(s: requests.Session, url: str) -> tuple[bytes, str] | None:
@@ -349,7 +382,7 @@ def generar(anio: int, salida: Path) -> tuple[Path, list[str]]:
     urls: list[str] = []
     numeros: list[tuple[str, list[dict]]] = []
     for mes in range(1, ultimo + 1):
-        arts = [a for a in (leer_articulo(s, u, urls) for u in articulos(s, mes, anio)) if a]
+        arts = numero(s, mes, anio, urls)
         if arts:
             numeros.append((f"{MESES[mes - 1].capitalize()} {anio}", arts))
     if not numeros:
