@@ -1,4 +1,9 @@
-"""Arma un EPUB con un número mensual de Crónica (cronicadigital.org), para leerlo como libro.
+"""Arma un EPUB anual de Crónica (cronicadigital.org) con las secciones elegidas, para leerlo como libro.
+
+Un solo libro por año ("Crónica 2026"), con un capítulo por número mensual publicado y, dentro,
+solo las secciones de SECCIONES (él eligió Editorial y Junto al Padre). Cada vez que sale un
+número se vuelve a armar el libro completo con el mismo nombre e identificador, así el número
+nuevo queda al final y lo ya leído no se mueve.
 
 Inicia sesión con la cuenta del suscriptor, igual que el navegador, y lee las páginas normales
 de los artículos. El EPUB es de lectura personal: nunca se guarda en este repo (es público) ni
@@ -10,8 +15,8 @@ Credencial, en este orden:
   2. el archivo DPAPI de Polonia\\apostolado\\cronica\\cronica.cred (este PC).
 
 Uso:
-    python cronica_epub.py "Agosto 2026"                 # deja Cronica_2026-08.epub en Documentos\\Crónica
-    python cronica_epub.py "Agosto 2026" --salida <dir>
+    python cronica_epub.py 2026                  # deja Cronica_2026.epub en Documentos\\Crónica
+    python cronica_epub.py 2026 --salida <dir>
 """
 from __future__ import annotations
 
@@ -24,7 +29,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import requests
@@ -40,17 +45,26 @@ SALIDA = Path.home() / "Documents" / "Crónica"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) lectura personal"
 MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
          "septiembre", "octubre", "noviembre", "diciembre"]
+# Sección de cada artículo = campo "location" de su página; se compara por el comienzo.
+SECCIONES = ("editorial", "junto al padre")
+BLOQUES = {"p", "h1", "h2", "h3", "h4", "h5", "blockquote", "ul", "ol", "figure", "img"}
+EXT = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
 
 CSS = """
 body { font-family: serif; line-height: 1.5; margin: 0 4%; }
 h1 { font-size: 1.5em; margin: 0.6em 0 0.2em; line-height: 1.2; }
 h2 { font-size: 1.15em; margin: 1.4em 0 0.4em; }
 p { margin: 0 0 0.7em; text-align: justify; }
-.lugar { font-variant: small-caps; letter-spacing: 0.05em; color: #666; margin: 0; }
+.seccion { font-variant: small-caps; letter-spacing: 0.05em; color: #666; margin: 0; }
 .bajada { font-style: italic; font-size: 1.05em; margin: 0.4em 0 1.2em; }
 .cabecera { width: 100%; margin: 0 0 0.6em; }
+figure { margin: 1em 0; text-align: center; }
+figure img { max-width: 100%; }
+figcaption { font-size: 0.85em; color: #666; font-style: italic; }
 .portada { text-align: center; margin-top: 30%; }
 .portada h1 { font-size: 2.2em; }
+.mes { text-align: center; margin-top: 35%; }
+.mes h1 { font-size: 2em; }
 """
 
 
@@ -97,13 +111,6 @@ def sesion() -> requests.Session:
 
 # ---------- lectura ----------
 
-def _mes_anio(nombre: str) -> tuple[int, int]:
-    mes, anio = nombre.strip().lower().split()
-    if mes not in MESES:
-        sys.exit(f"Mes no reconocido: {mes}")
-    return MESES.index(mes) + 1, int(anio)
-
-
 def articulos(s: requests.Session, mes: int, anio: int) -> list[str]:
     """Enlaces de los artículos del número, en el orden en que los muestra el sitio."""
     base = f"{BASE}/es/category/{anio}-es/{MESES[mes - 1]}-{anio}-es/"
@@ -130,33 +137,14 @@ def _texto(el) -> str:
     return el.get_text(" ", strip=True) if el else ""
 
 
-def _limpiar_cuerpo(cuerpo) -> str:
-    """Deja solo p, subtítulos, énfasis, citas y listas, como XHTML válido."""
-    partes = []
-    for el in cuerpo.find_all(["p", "h1", "h2", "h3", "h4", "blockquote", "ul", "ol"], recursive=True):
-        if el.find_parent(["blockquote", "ul", "ol"]) not in (None,) and el.name not in ("blockquote", "ul", "ol"):
-            continue
-        if el.name in ("h1", "h2", "h3", "h4"):
-            t = _texto(el)
-            if t:
-                partes.append(f"<h2>{html.escape(t)}</h2>")
-        elif el.name in ("ul", "ol"):
-            items = "".join(f"<li>{_inline(li)}</li>" for li in el.find_all("li", recursive=False))
-            partes.append(f"<{el.name}>{items}</{el.name}>")
-        elif el.name == "blockquote":
-            partes.append(f"<blockquote><p>{_inline(el)}</p></blockquote>")
-        else:
-            t = _inline(el)
-            if t.strip():
-                partes.append(f"<p>{t}</p>")
-    return "\n".join(partes)
-
-
 def _inline(el) -> str:
     """Texto con cursivas y negritas, escapado."""
     salida = []
     for nodo in el.descendants:
         if isinstance(nodo, str):
+            if nodo.find_parent("figure") is not None and el.name != "figcaption" \
+                    and el.find_parent("figure") is None:
+                continue
             padres = {p.name for p in nodo.parents if p is not el and p is not None}
             t = html.escape(str(nodo))
             if padres & {"em", "i"}:
@@ -169,26 +157,81 @@ def _inline(el) -> str:
     return re.sub(r"\s+", " ", "".join(salida)).strip()
 
 
-def leer_articulo(s: requests.Session, url: str) -> dict:
+def _src(img) -> str | None:
+    for attr in ("data-src", "data-lazy-src", "src"):
+        v = img.get(attr)
+        if v and not v.startswith("data:"):
+            return v
+    return None
+
+
+def _cuerpo(cuerpo, urls: list[str]) -> str:
+    """XHTML del cuerpo: párrafos, subtítulos, énfasis, citas, listas y fotos con su pie.
+    Cada foto queda como src="IMG<n>", con n el índice en urls; se resuelve al armar el EPUB."""
+    def foto(img, pie: str = "") -> str:
+        u = _src(img)
+        if not u:
+            return ""
+        urls.append(u)
+        cap = f"<figcaption>{pie}</figcaption>" if pie else ""
+        return f'<figure><img src="IMG{len(urls) - 1}" alt=""/>{cap}</figure>'
+
+    partes = []
+    for el in cuerpo.find_all(BLOQUES):
+        if any(p.name in BLOQUES for p in el.parents if p is not cuerpo and p.name):
+            continue  # ya lo cubre el bloque que lo contiene
+        if el.name in ("h1", "h2", "h3", "h4", "h5"):
+            t = _texto(el)
+            if t:
+                partes.append(f"<h2>{html.escape(t)}</h2>")
+        elif el.name == "figure":
+            img = el.find("img")
+            pie = _inline(el.find("figcaption")) if el.find("figcaption") else ""
+            if img is not None:
+                partes.append(foto(img, pie))
+            elif pie:
+                partes.append(f"<p>{pie}</p>")
+        elif el.name == "img":
+            partes.append(foto(el))
+        elif el.name in ("ul", "ol"):
+            items = "".join(f"<li>{_inline(li)}</li>" for li in el.find_all("li", recursive=False))
+            partes.append(f"<{el.name}>{items}</{el.name}>")
+        elif el.name == "blockquote":
+            partes.append(f"<blockquote><p>{_inline(el)}</p></blockquote>")
+        else:
+            for img in el.find_all("img"):
+                partes.append(foto(img))
+            t = _inline(el)
+            if t.strip():
+                partes.append(f"<p>{t}</p>")
+    return "\n".join(p for p in partes if p)
+
+
+def leer_articulo(s: requests.Session, url: str, urls: list[str]) -> dict | None:
+    """El artículo, o None si no es de una sección elegida."""
     r = s.get(url, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     if soup.select_one(".um-page-loggedout"):
         sys.exit("Un artículo volvió al login: la sesión no quedó iniciada.")
+    seccion = _texto(soup.select_one(".post_custom_field.location"))
+    if not seccion.lower().startswith(SECCIONES):
+        return None
     cuerpo = soup.select_one(".post_content")
     if cuerpo is None:
         sys.exit("Cambió la estructura del sitio: no aparece .post_content.")
-    titulo = _texto(soup.select_one(".post_title")) or (soup.find("meta", property="og:title") or {}).get("content", "")
+    titulo = _texto(soup.select_one(".post_title")) or seccion
+    cabecera = None
     img = soup.select_one(".post_image img")
-    img_url = None
-    if img is not None:
-        img_url = img.get("data-src") or img.get("src")
+    if img is not None and _src(img):
+        urls.append(_src(img))
+        cabecera = len(urls) - 1
     return {
         "titulo": titulo,
-        "lugar": _texto(soup.select_one(".post_custom_field.location")),
+        "seccion": seccion,
         "bajada": _texto(soup.select_one(".post_custom_field.foreword")),
-        "cuerpo": _limpiar_cuerpo(cuerpo),
-        "img_url": img_url,
+        "cabecera": cabecera,
+        "cuerpo": _cuerpo(cuerpo, urls),
     }
 
 
@@ -199,9 +242,7 @@ def bajar_imagen(s: requests.Session, url: str) -> tuple[bytes, str] | None:
     except requests.RequestException:
         return None
     tipo = r.headers.get("Content-Type", "").split(";")[0] or mimetypes.guess_type(url)[0] or ""
-    if tipo not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-        return None
-    return r.content, tipo
+    return (r.content, tipo) if tipo in EXT else None
 
 
 # ---------- EPUB ----------
@@ -215,50 +256,74 @@ def _xhtml(titulo: str, cuerpo: str) -> str:
             f'<body>\n{cuerpo}\n</body>\n</html>\n')
 
 
-def armar_epub(destino: Path, nombre: str, arts: list[dict], imagenes: dict[int, tuple[bytes, str]]) -> None:
-    ident = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, 'cronica ' + nombre)}"
-    ext = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+def armar_epub(destino: Path, anio: int, numeros: list[tuple[str, list[dict]]],
+               imagenes: dict[int, tuple[bytes, str]]) -> None:
+    """numeros: [(nombre del mes, artículos)] en orden. Escribe a un temporal y reemplaza."""
+    titulo_libro = f"Crónica {anio}"
+    ident = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, f'cronica {anio} editorial y junto al padre')}"
     manifest, spine, nav = [], [], []
+    D = zipfile.ZIP_DEFLATED
 
-    with zipfile.ZipFile(destino, "w") as z:
+    def img_tag(m: re.Match) -> str:
+        return f'src="img{int(m.group(1)):03d}.{EXT[imagenes[int(m.group(1))][1]]}"'
+
+    def resolver(xhtml: str) -> str:
+        # Fotos que no se pudieron bajar: se quita la figura entera.
+        xhtml = re.sub(r'<figure><img src="IMG(\d+)" alt=""/>.*?</figure>',
+                       lambda m: m.group(0) if int(m.group(1)) in imagenes else "", xhtml)
+        xhtml = re.sub(r'<img class="cabecera" src="IMG(\d+)" alt=""/>',
+                       lambda m: m.group(0) if int(m.group(1)) in imagenes else "", xhtml)
+        return re.sub(r'src="IMG(\d+)"', img_tag, xhtml)
+
+    tmp = destino.with_suffix(".tmp")
+    with zipfile.ZipFile(tmp, "w") as z:
         z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         z.writestr("META-INF/container.xml",
                    '<?xml version="1.0"?>\n<container version="1.0" '
                    'xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
                    '<rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
-                   '</rootfiles></container>', compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("OEBPS/estilo.css", CSS, compress_type=zipfile.ZIP_DEFLATED)
+                   '</rootfiles></container>', compress_type=D)
+        z.writestr("OEBPS/estilo.css", CSS, compress_type=D)
         manifest.append('<item id="css" href="estilo.css" media-type="text/css"/>')
 
-        portada = (f'<div class="portada"><h1>Crónica</h1><p>{html.escape(nombre)}</p></div>')
-        z.writestr("OEBPS/portada.xhtml", _xhtml(f"Crónica {nombre}", portada), compress_type=zipfile.ZIP_DEFLATED)
+        portada = (f'<div class="portada"><h1>{titulo_libro}</h1>'
+                   '<p>Editorial y Junto al Padre</p></div>')
+        z.writestr("OEBPS/portada.xhtml", _xhtml(titulo_libro, portada), compress_type=D)
         manifest.append('<item id="portada" href="portada.xhtml" media-type="application/xhtml+xml"/>')
         spine.append('<itemref idref="portada"/>')
 
-        for i, a in enumerate(arts, 1):
-            partes = []
-            if i in imagenes:
-                datos, tipo = imagenes[i]
-                archivo = f"img{i:02d}.{ext[tipo]}"
-                z.writestr(f"OEBPS/{archivo}", datos, compress_type=zipfile.ZIP_STORED)
-                manifest.append(f'<item id="img{i:02d}" href="{archivo}" media-type="{tipo}"/>')
-                partes.append(f'<img class="cabecera" src="{archivo}" alt=""/>')
-            if a["lugar"]:
-                partes.append(f'<p class="lugar">{html.escape(a["lugar"])}</p>')
-            partes.append(f'<h1>{html.escape(a["titulo"])}</h1>')
-            if a["bajada"]:
-                partes.append(f'<p class="bajada">{html.escape(a["bajada"])}</p>')
-            partes.append(a["cuerpo"])
-            archivo = f"art{i:02d}.xhtml"
-            z.writestr(f"OEBPS/{archivo}", _xhtml(a["titulo"], "\n".join(partes)),
-                       compress_type=zipfile.ZIP_DEFLATED)
-            manifest.append(f'<item id="art{i:02d}" href="{archivo}" media-type="application/xhtml+xml"/>')
-            spine.append(f'<itemref idref="art{i:02d}"/>')
-            nav.append(f'<li><a href="{archivo}">{html.escape(a["titulo"])}</a></li>')
+        for n, (mes, arts) in enumerate(numeros, 1):
+            mid = f"m{n:02d}"
+            z.writestr(f"OEBPS/{mid}.xhtml", _xhtml(mes, f'<div class="mes"><h1>{html.escape(mes)}</h1></div>'),
+                       compress_type=D)
+            manifest.append(f'<item id="{mid}" href="{mid}.xhtml" media-type="application/xhtml+xml"/>')
+            spine.append(f'<itemref idref="{mid}"/>')
+            sub = []
+            for i, a in enumerate(arts, 1):
+                partes = []
+                if a["cabecera"] is not None:
+                    partes.append(f'<img class="cabecera" src="IMG{a["cabecera"]}" alt=""/>')
+                partes.append(f'<p class="seccion">{html.escape(a["seccion"])}</p>')
+                partes.append(f'<h1>{html.escape(a["titulo"])}</h1>')
+                if a["bajada"]:
+                    partes.append(f'<p class="bajada">{html.escape(a["bajada"])}</p>')
+                partes.append(a["cuerpo"])
+                aid = f"{mid}a{i:02d}"
+                z.writestr(f"OEBPS/{aid}.xhtml", resolver(_xhtml(a["titulo"], "\n".join(partes))),
+                           compress_type=D)
+                manifest.append(f'<item id="{aid}" href="{aid}.xhtml" media-type="application/xhtml+xml"/>')
+                spine.append(f'<itemref idref="{aid}"/>')
+                sub.append(f'<li><a href="{aid}.xhtml">{html.escape(a["seccion"])}: '
+                           f'{html.escape(a["titulo"])}</a></li>')
+            nav.append(f'<li><a href="{mid}.xhtml">{html.escape(mes)}</a><ol>{"".join(sub)}</ol></li>')
 
-        indice = (f'<nav epub:type="toc" id="toc"><h1>Índice</h1><ol>\n'
-                  + "\n".join(nav) + '\n</ol></nav>')
-        z.writestr("OEBPS/nav.xhtml", _xhtml("Índice", indice), compress_type=zipfile.ZIP_DEFLATED)
+        for k, (datos, tipo) in sorted(imagenes.items()):
+            archivo = f"img{k:03d}.{EXT[tipo]}"
+            z.writestr(f"OEBPS/{archivo}", datos, compress_type=zipfile.ZIP_STORED)
+            manifest.append(f'<item id="img{k:03d}" href="{archivo}" media-type="{tipo}"/>')
+
+        indice = '<nav epub:type="toc" id="toc"><h1>Índice</h1><ol>\n' + "\n".join(nav) + '\n</ol></nav>'
+        z.writestr("OEBPS/nav.xhtml", _xhtml("Índice", indice), compress_type=D)
         manifest.append('<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
         spine.insert(1, '<itemref idref="nav"/>')
 
@@ -267,44 +332,50 @@ def armar_epub(destino: Path, nombre: str, arts: list[dict], imagenes: dict[int,
                '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid" xml:lang="es">\n'
                '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
                f'<dc:identifier id="uid">{ident}</dc:identifier>\n'
-               f'<dc:title>Crónica {html.escape(nombre)}</dc:title>\n'
+               f'<dc:title>{titulo_libro}</dc:title>\n'
                '<dc:language>es</dc:language>\n<dc:publisher>Crónica</dc:publisher>\n'
                f'<meta property="dcterms:modified">{modificado}</meta>\n'
                '</metadata>\n<manifest>\n' + "\n".join(manifest) + '\n</manifest>\n'
                '<spine>\n' + "\n".join(spine) + '\n</spine>\n</package>\n')
-        z.writestr("OEBPS/content.opf", opf, compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr("OEBPS/content.opf", opf, compress_type=D)
+    tmp.replace(destino)
 
 
-def generar(nombre: str, salida: Path) -> Path:
-    mes, anio = _mes_anio(nombre)
-    nombre = f"{MESES[mes - 1].capitalize()} {anio}"
+def generar(anio: int, salida: Path) -> tuple[Path, list[str]]:
+    """Arma el libro del año con todos los números publicados. Devuelve la ruta y los meses."""
     s = sesion()
-    enlaces = articulos(s, mes, anio)
-    if not enlaces:
-        sys.exit(f"Crónica {nombre}: sin artículos (¿no ha salido?).")
-    arts, imagenes = [], {}
-    for i, url in enumerate(enlaces, 1):
-        a = leer_articulo(s, url)
-        arts.append(a)
-        if a["img_url"]:
-            img = bajar_imagen(s, a["img_url"])
-            if img:
-                imagenes[i] = img
+    hoy = date.today()
+    ultimo = 12 if anio < hoy.year else hoy.month
+    urls: list[str] = []
+    numeros: list[tuple[str, list[dict]]] = []
+    for mes in range(1, ultimo + 1):
+        arts = [a for a in (leer_articulo(s, u, urls) for u in articulos(s, mes, anio)) if a]
+        if arts:
+            numeros.append((f"{MESES[mes - 1].capitalize()} {anio}", arts))
+    if not numeros:
+        sys.exit(f"Crónica {anio}: sin números publicados.")
+    imagenes = {}
+    for k, u in enumerate(urls):
+        img = bajar_imagen(s, u)
+        if img:
+            imagenes[k] = img
     salida.mkdir(parents=True, exist_ok=True)
-    destino = salida / f"Cronica_{anio}-{mes:02d}.epub"
-    armar_epub(destino, nombre, arts, imagenes)
+    destino = salida / f"Cronica_{anio}.epub"
+    armar_epub(destino, anio, numeros, imagenes)
     # Solo conteos: los registros de Actions son públicos.
-    print(f"Crónica {nombre}: {len(arts)} artículos, {len(imagenes)} imágenes -> {destino.name}")
-    return destino
+    total = sum(len(a) for _, a in numeros)
+    print(f"Crónica {anio}: {len(numeros)} números, {total} artículos, "
+          f"{len(imagenes)}/{len(urls)} imágenes -> {destino.name}")
+    return destino, [m for m, _ in numeros]
 
 
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("numero", help='"Agosto 2026"')
+    ap.add_argument("anio", type=int, help="2026")
     ap.add_argument("--salida", type=Path, default=SALIDA)
     a = ap.parse_args()
-    generar(a.numero, a.salida)
+    generar(a.anio, a.salida)
 
 
 if __name__ == "__main__":
