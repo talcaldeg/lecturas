@@ -17,6 +17,7 @@ Credencial, en este orden:
 Uso:
     python cronica_epub.py 2026                  # deja Cronica_2026.epub en Documentos\\Crónica
     python cronica_epub.py 2026 --salida <dir>
+    python cronica_epub.py --enviar-pendientes --salida <dir>   # GitHub Actions
 """
 from __future__ import annotations
 
@@ -275,7 +276,31 @@ def bajar_imagen(s: requests.Session, url: str) -> tuple[bytes, str] | None:
     except requests.RequestException:
         return None
     tipo = r.headers.get("Content-Type", "").split(";")[0] or mimetypes.guess_type(url)[0] or ""
-    return (r.content, tipo) if tipo in EXT else None
+    if tipo not in EXT:
+        return None
+    return _achicar(r.content, tipo)
+
+
+def _achicar(datos: bytes, tipo: str) -> tuple[bytes, str]:
+    """Fotos a 1200 px de ancho en JPEG: el libro pesa menos y Telegram acepta hasta 50 MB.
+    Sin Pillow, la foto queda tal cual."""
+    try:
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        return datos, tipo
+    try:
+        im = Image.open(BytesIO(datos))
+        if getattr(im, "is_animated", False):
+            return datos, tipo
+        im = im.convert("RGB")
+        if im.width > 1200:
+            im = im.resize((1200, round(im.height * 1200 / im.width)), Image.LANCZOS)
+        out = BytesIO()
+        im.save(out, "JPEG", quality=82, optimize=True)
+    except Exception:
+        return datos, tipo
+    return (out.getvalue(), "image/jpeg") if out.tell() < len(datos) else (datos, tipo)
 
 
 # ---------- EPUB ----------
@@ -402,13 +427,69 @@ def generar(anio: int, salida: Path) -> tuple[Path, list[str]]:
     return destino, [m for m, _ in numeros]
 
 
+# ---------- envío automático (GitHub Actions, después de cronica.py) ----------
+
+def enviar_documento(ruta: Path, texto: str) -> bool:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat:
+        sys.exit("ERROR: faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
+    for i in range(3):
+        try:
+            with ruta.open("rb") as f:
+                r = requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
+                                  data={"chat_id": chat, "caption": texto},
+                                  files={"document": (ruta.name, f, "application/epub+zip")},
+                                  timeout=180)
+            if r.ok and r.json().get("ok"):
+                return True
+            print(f"Telegram, intento {i + 1}: HTTP {r.status_code}")
+        except requests.RequestException as ex:
+            print(f"Telegram, intento {i + 1} falló: {type(ex).__name__}")
+    return False
+
+
+def enviar_pendientes(salida: Path) -> None:
+    """Rearma y manda el libro del año cuando hay números con libro=false en cronica.json.
+    Espera un día desde que se detectó el número, porque el sitio lo carga durante una mañana.
+    Idempotente: si Telegram falla, quedan en false y se reintenta en la corrida siguiente."""
+    import json
+    archivo = Path(__file__).with_name("cronica.json")
+    numeros = json.loads(archivo.read_text(encoding="utf-8"))
+    hoy = date.today().isoformat()
+    for n in numeros:
+        n.setdefault("detectado", hoy)
+    listos = [n for n in numeros if not n.get("libro") and n["detectado"] < hoy]
+    for anio in sorted({int(n["fecha"][:4]) for n in listos}):
+        ruta, meses = generar(anio, salida)
+        nuevos = ", ".join(n["nombre"].replace("Crónica ", "") for n in listos if n["fecha"].startswith(str(anio)))
+        texto = f"📚 Crónica {anio} (Editorial y Junto al Padre), con {nuevos}. {len(meses)} números en total."
+        if enviar_documento(ruta, texto):
+            for n in numeros:
+                if n["fecha"].startswith(str(anio)):
+                    n["libro"] = True
+            print(f"Libro {anio} enviado.")
+        else:
+            print(f"ERROR: el libro {anio} no se pudo enviar; se reintenta mañana.")
+    archivo.write_text(json.dumps(numeros, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    if not listos:
+        print("Sin números nuevos para el libro.")
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("anio", type=int, help="2026")
+    ap.add_argument("anio", type=int, nargs="?", help="2026")
     ap.add_argument("--salida", type=Path, default=SALIDA)
+    ap.add_argument("--enviar-pendientes", action="store_true",
+                    help="modo Actions: rearma y manda por Telegram el libro de los números nuevos")
     a = ap.parse_args()
-    generar(a.anio, a.salida)
+    if a.enviar_pendientes:
+        enviar_pendientes(a.salida)
+    elif a.anio:
+        generar(a.anio, a.salida)
+    else:
+        ap.error("falta el año o --enviar-pendientes")
 
 
 if __name__ == "__main__":
