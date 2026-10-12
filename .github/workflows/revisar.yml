@@ -19,6 +19,9 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      # Sin la cuenta de Cronica cargada, el paso del libro se salta en vez de fallar.
+      HAY_CRONICA: ${{ secrets.CRONICA_USER != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +49,20 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python cronica.py
+
+      # Libro anual de Cronica (Editorial y Junto al Padre) en EPUB, por Telegram.
+      # Inicia sesion con la cuenta del suscriptor; el EPUB queda fuera del repo y
+      # el script solo imprime conteos (estos registros son publicos).
+      - name: Rearmar y enviar el libro de Cronica
+        if: always() && steps.autotest.outcome == 'success' && env.HAY_CRONICA == 'true'
+        env:
+          CRONICA_USER: ${{ secrets.CRONICA_USER }}
+          CRONICA_PASS: ${{ secrets.CRONICA_PASS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          pip install --quiet requests beautifulsoup4 pillow
+          python cronica_epub.py --enviar-pendientes --salida "$RUNNER_TEMP/libro"
 
       # Se guarda aunque Telegram haya fallado, para no perder los nuevos.
       - name: Guardar mensajes.json y cronica.json
