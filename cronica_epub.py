@@ -51,22 +51,36 @@ SECCIONES = ("editorial", "junto al padre")
 BLOQUES = {"p", "h1", "h2", "h3", "h4", "h5", "blockquote", "ul", "ol", "figure", "img"}
 EXT = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
 
-CSS = """
-body { font-family: serif; line-height: 1.5; margin: 0 4%; }
-h1 { font-size: 1.5em; margin: 0.6em 0 0.2em; line-height: 1.2; }
-h2 { font-size: 1.15em; margin: 1.4em 0 0.4em; }
-p { margin: 0 0 0.7em; text-align: justify; }
-.seccion { font-variant: small-caps; letter-spacing: 0.05em; color: #666; margin: 0; }
-.bajada { font-style: italic; font-size: 1.05em; margin: 0.4em 0 1.2em; }
-.cabecera { width: 100%; margin: 0 0 0.6em; }
-figure { margin: 1em 0; text-align: center; }
-figure img { max-width: 100%; }
-figcaption { font-size: 0.85em; color: #666; font-style: italic; }
-.portada { text-align: center; margin-top: 30%; }
-.portada h1 { font-size: 2.2em; }
-.mes { text-align: center; margin-top: 35%; }
-.mes h1 { font-size: 2em; }
+# Un título no se parte entre dos páginas ni queda solo al pie de una: va entero y pegado a
+# lo que sigue. "break-after: avoid" no lo respetan todos los lectores, así que además el
+# título viaja en un bloque .junto con su primer párrafo (ver _juntar).
+NO_CORTAR = ("page-break-inside: avoid; break-inside: avoid; "
+             "-webkit-column-break-inside: avoid;")
+NO_SEPARAR = ("page-break-after: avoid; break-after: avoid; "
+              "-webkit-column-break-after: avoid;")
+CSS = f"""
+body {{ font-family: serif; line-height: 1.5; margin: 0 4%; }}
+h1, h2 {{ text-align: left; -webkit-hyphens: none; hyphens: none; {NO_CORTAR} {NO_SEPARAR} }}
+h1 {{ font-size: 1.5em; margin: 0.6em 0 0.2em; line-height: 1.2; }}
+h2 {{ font-size: 1.15em; margin: 1.4em 0 0.4em; line-height: 1.25; }}
+p {{ margin: 0 0 0.7em; text-align: justify; orphans: 2; widows: 2; }}
+.junto {{ {NO_CORTAR} }}
+.seccion {{ font-variant: small-caps; letter-spacing: 0.05em; color: #666; margin: 0; {NO_SEPARAR} }}
+.bajada {{ font-style: italic; font-size: 1.05em; margin: 0.4em 0 1.2em; }}
+.separador {{ text-align: center; margin: 1.2em 0; }}
+.cabecera {{ display: block; max-width: 100%; max-height: 45vh; margin: 0 auto 0.6em; }}
+figure {{ margin: 1em 0; text-align: center; {NO_CORTAR} }}
+figure img {{ max-width: 100%; }}
+figcaption {{ font-size: 0.85em; color: #666; font-style: italic; }}
+.portada {{ text-align: center; margin-top: 30%; }}
+.portada h1 {{ font-size: 2.2em; text-align: center; }}
+.mes {{ text-align: center; margin-top: 35%; }}
+.mes h1 {{ font-size: 2em; text-align: center; }}
 """
+BR = "\x00"          # marca interna de un <br> del sitio; nunca llega al libro
+VERSO_MAX = 60       # largo máximo de una línea para tomar el bloque como verso
+JUNTO_MAX = 700      # un párrafo más largo no cabe con su título en una pantalla chica
+MINUS = "a-záéíóúüñ"
 
 
 # ---------- sesión ----------
@@ -154,8 +168,43 @@ def _inline(el) -> str:
                 t = f"<strong>{t}</strong>"
             salida.append(t)
         elif getattr(nodo, "name", None) == "br":
-            salida.append("<br/>")
-    return re.sub(r"\s+", " ", "".join(salida)).strip()
+            salida.append(BR)
+    return _saltos(re.sub(r"\s+", " ", "".join(salida)).strip())
+
+
+def _saltos(t: str) -> str:
+    """El sitio arrastra los <br> de la maqueta impresa: caen en medio de una frase y hasta
+    parten una palabra con guion ("su-<br>surro"). En prosa se cambian por un espacio y la
+    palabra partida se vuelve a unir; solo se conservan en verso (tres o más líneas cortas)."""
+    lineas = [x.strip() for x in t.split(BR)]
+    lineas = [x for x in lineas if x]
+    if len(lineas) < 2:
+        return "".join(lineas)
+    if len(lineas) >= 3 and all(len(re.sub(r"<[^>]+>", "", x)) <= VERSO_MAX for x in lineas):
+        return "<br/>".join(lineas)
+    salida = lineas[0]
+    for x in lineas[1:]:
+        if re.search(f"[{MINUS}]-$", salida) and re.match(f"[{MINUS}]", x):
+            salida = salida[:-1] + x
+        else:
+            salida += " " + x
+    return salida
+
+
+def _juntar(partes: list[str]) -> list[str]:
+    """Cada subtítulo queda en un mismo bloque con el párrafo que lo sigue, para que el cambio
+    de página no los separe. Si el párrafo es muy largo, el bloque no cabría en una pantalla
+    chica y el lector lo partiría igual: ahí queda solo la regla del CSS."""
+    salida, i = [], 0
+    while i < len(partes):
+        sig = partes[i + 1] if i + 1 < len(partes) else ""
+        if partes[i].startswith("<h2>") and sig.startswith("<p>") and len(sig) <= JUNTO_MAX:
+            salida.append(f'<div class="junto">{partes[i]}\n{sig}</div>')
+            i += 2
+        else:
+            salida.append(partes[i])
+            i += 1
+    return salida
 
 
 def _src(img) -> str | None:
@@ -203,9 +252,11 @@ def _cuerpo(cuerpo, urls: list[str]) -> str:
             for img in el.find_all("img"):
                 partes.append(foto(img))
             t = _inline(el)
-            if t.strip():
+            if re.fullmatch(r"(\*\s*){3,}", re.sub(r"<[^>]+>", "", t)):
+                partes.append('<p class="separador">* * *</p>')
+            elif t.strip():
                 partes.append(f"<p>{t}</p>")
-    return "\n".join(p for p in partes if p)
+    return "\n".join(_juntar([p for p in partes if p]))
 
 
 def pagina(s: requests.Session, url: str) -> BeautifulSoup:
@@ -358,13 +409,15 @@ def armar_epub(destino: Path, anio: int, numeros: list[tuple[str, list[dict]]],
             spine.append(f'<itemref idref="{mid}"/>')
             sub = []
             for i, a in enumerate(arts, 1):
-                partes = []
+                # Foto, sección, título y bajada en un solo bloque: el título no se corta.
+                partes = ['<div class="junto">']
                 if a["cabecera"] is not None:
                     partes.append(f'<img class="cabecera" src="IMG{a["cabecera"]}" alt=""/>')
                 partes.append(f'<p class="seccion">{html.escape(a["seccion"])}</p>')
                 partes.append(f'<h1>{html.escape(a["titulo"])}</h1>')
                 if a["bajada"]:
                     partes.append(f'<p class="bajada">{html.escape(a["bajada"])}</p>')
+                partes.append('</div>')
                 partes.append(a["cuerpo"])
                 aid = f"{mid}a{i:02d}"
                 z.writestr(f"OEBPS/{aid}.xhtml", resolver(_xhtml(a["titulo"], "\n".join(partes))),
@@ -476,6 +529,36 @@ def enviar_pendientes(salida: Path) -> None:
         print("Sin números nuevos para el libro.")
 
 
+def autotest() -> None:
+    """Sin red: los saltos de línea de la maqueta y los títulos pegados a su texto."""
+    def cuerpo(h: str) -> str:
+        return _cuerpo(BeautifulSoup(f"<div>{h}</div>", "html.parser").div, [])
+
+    largo = "palabra " * 30
+    casos = [
+        # <br> en medio de una frase: espacio
+        (f"<p>{largo}grandes<br> corrupciones, la hostilidad.</p>", "grandes corrupciones", "<br"),
+        # palabra partida con guion: se vuelve a unir
+        (f"<p>{largo}oiga el su-<br> surro de Dios.</p>", "el susurro de Dios", "su-"),
+        # <br> después de un punto, en prosa: tampoco queda
+        (f"<p>{largo}del órgano.<br> A la hora señalada.</p>", "órgano. A la hora", "<br"),
+        # verso: se conserva
+        ("<p>Uno de los versos<br>otro verso corto<br>y el último</p>", "versos<br/>otro", None),
+        # subtítulo en el mismo bloque que su párrafo
+        ("<h2>Subtítulo</h2><p>Texto.</p>", '<div class="junto"><h2>Subtítulo</h2>\n<p>Texto.</p></div>', None),
+        # separador
+        ("<p><strong><em>* * *</em></strong></p>", '<p class="separador">* * *</p>', None),
+    ]
+    for entrada, debe, no_debe in casos:
+        x = cuerpo(entrada)
+        assert debe in x, f"falta {debe!r} en {x[-120:]!r}"
+        assert no_debe is None or no_debe not in x, f"sobra {no_debe!r} en {x[-120:]!r}"
+        assert BR not in x
+    for regla in ("break-after: avoid", "break-inside: avoid"):
+        assert regla in CSS.split("h1, h2 {")[1].split("}")[0], f"el CSS de los títulos perdió {regla}"
+    print(f"autotest del libro: {len(casos)} casos y el CSS de los títulos, bien.")
+
+
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -483,8 +566,12 @@ def main() -> None:
     ap.add_argument("--salida", type=Path, default=SALIDA)
     ap.add_argument("--enviar-pendientes", action="store_true",
                     help="modo Actions: rearma y manda por Telegram el libro de los números nuevos")
+    ap.add_argument("--autotest", action="store_true",
+                    help="prueba sin red los saltos de línea y los títulos")
     a = ap.parse_args()
-    if a.enviar_pendientes:
+    if a.autotest:
+        autotest()
+    elif a.enviar_pendientes:
         enviar_pendientes(a.salida)
     elif a.anio:
         generar(a.anio, a.salida)
