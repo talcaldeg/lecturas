@@ -62,6 +62,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           pip install --quiet requests beautifulsoup4 pillow
+          python cronica_epub.py --autotest
           python cronica_epub.py --enviar-pendientes --salida "$RUNNER_TEMP/libro"
 
       # Se guarda aunque Telegram haya fallado, para no perder los nuevos.

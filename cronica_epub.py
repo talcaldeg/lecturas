@@ -452,6 +452,18 @@ def armar_epub(destino: Path, anio: int, numeros: list[tuple[str, list[dict]]],
     tmp.replace(destino)
 
 
+def _control_diseno(destino: Path) -> None:
+    """En este PC el libro pasa por el control de diseño de Laboral, que lo mide paginado
+    (títulos cortados o solos al pie, saltos de línea que sobran) y falla si encuentra algo.
+    En GitHub Actions ese control no existe: allá las mismas reglas las cubre --autotest."""
+    lib = Path.home() / "Desktop" / "Personal" / "Claude" / "Laboral" / "lib"
+    if not (lib / "auditar_epub.py").exists():
+        return
+    sys.path.insert(0, str(lib))
+    from auditar_epub import exigir_diseno
+    exigir_diseno(destino)
+
+
 def generar(anio: int, salida: Path) -> tuple[Path, list[str]]:
     """Arma el libro del año con todos los números publicados. Devuelve la ruta y los meses."""
     s = sesion()
@@ -473,6 +485,7 @@ def generar(anio: int, salida: Path) -> tuple[Path, list[str]]:
     salida.mkdir(parents=True, exist_ok=True)
     destino = salida / f"Cronica_{anio}.epub"
     armar_epub(destino, anio, numeros, imagenes)
+    _control_diseno(destino)
     # Solo conteos: los registros de Actions son públicos.
     total = sum(len(a) for _, a in numeros)
     print(f"Crónica {anio}: {len(numeros)} números, {total} artículos, "
@@ -537,11 +550,11 @@ def autotest() -> None:
     largo = "palabra " * 30
     casos = [
         # <br> en medio de una frase: espacio
-        (f"<p>{largo}grandes<br> corrupciones, la hostilidad.</p>", "grandes corrupciones", "<br"),
+        (f"<p>{largo}la frase<br> sigue en la otra línea.</p>", "la frase sigue en la otra", "<br"),
         # palabra partida con guion: se vuelve a unir
-        (f"<p>{largo}oiga el su-<br> surro de Dios.</p>", "el susurro de Dios", "su-"),
+        (f"<p>{largo}una pala-<br> bra partida.</p>", "una palabra partida", "pala-"),
         # <br> después de un punto, en prosa: tampoco queda
-        (f"<p>{largo}del órgano.<br> A la hora señalada.</p>", "órgano. A la hora", "<br"),
+        (f"<p>{largo}termina aquí.<br> Y sigue aquí.</p>", "aquí. Y sigue", "<br"),
         # verso: se conserva
         ("<p>Uno de los versos<br>otro verso corto<br>y el último</p>", "versos<br/>otro", None),
         # subtítulo en el mismo bloque que su párrafo
